@@ -1,0 +1,54 @@
+defaults:
+  - data: weave
+  - _self_
+
+name: awd
+seed: 0
+device: cuda
+steps: 20000
+batch_size: 128
+lr: 0.0001
+weight_decay: 0.01
+grad_clip: 1.0
+log_every: 20
+ema_decay: 0.999
+# Advantage is the sampled clip's reward minus the batch mean, divided by the
+# batch standard deviation. Weights are exp(advantage / beta), clipped, mean 1.
+beta: 1.0
+weight_max: 10.0
+# DDIM steps used to draw the clips that become denoising targets.
+rollout_steps: 40
+# Mean squared gap between this denoiser and the frozen pretrained denoiser.
+bc_weight: 1.0
+# Required. A last.pt written by scripts/train_diffusion.py.
+diffusion: null
+
+data:
+  sample_hz: 10
+  relative_rotation: true
+
+sample:
+  every: 500
+  steps: 80
+  batch: 16
+  count: 4
+  playback_hz: 50
+
+checkpoint:
+  every: 500
+  keep_last: 3
+  resume: null
+
+swanlab:
+  project: genrl
+  name: ${name}
+  key: /mnt/workspace/btx0424/swanlab_key
+
+robot:
+  urdf: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/${name}/${now:%Y-%m-%d_%H-%M-%S}

@@ -1,0 +1,58 @@
+defaults:
+  - data: weave
+  - _self_
+
+name: qgf
+seed: 0
+device: cuda
+steps: 50000
+batch_size: 128
+grad_clip: 1.0
+log_every: 20
+# 1/beta in the QGF velocity update. Q targets are z-scored rewards.
+guidance: 0.1
+# Required. A last.pt written by scripts/train_flow_matching.py. The flow stays frozen.
+flow: null
+
+iql:
+  expectile: 0.9
+  # Each clip is one terminal transition, so the backup is the reward itself.
+  discount: 0.0
+  ensemble: 2
+  hidden: 256
+  lr: 0.0003
+  weight_decay: 0.0
+  target_decay: 0.995
+  # Clips drawn from the frozen flow, labeled with the same reward as the dataset.
+  generated_steps: 80
+  generated_weight: 1.0
+
+data:
+  sample_hz: 10
+  relative_rotation: true
+
+sample:
+  every: 500
+  steps: 80
+  batch: 16
+  count: 4
+  playback_hz: 50
+
+checkpoint:
+  every: 500
+  keep_last: 3
+  resume: null
+
+swanlab:
+  project: genrl
+  name: ${name}
+  key: /mnt/workspace/btx0424/swanlab_key
+
+robot:
+  urdf: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/${name}/${now:%Y-%m-%d_%H-%M-%S}

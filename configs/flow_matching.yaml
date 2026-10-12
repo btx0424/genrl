@@ -1,0 +1,47 @@
+defaults:
+  - data: weave
+  - model: dit
+  - _self_
+
+name: flow_matching
+seed: 0
+device: cuda
+steps: 50000
+batch_size: 128
+lr: 0.0002
+weight_decay: 0.01
+grad_clip: 1.0
+log_every: 20
+t_eps: 0.01
+ema_decay: 0.999
+cond_steps: 1
+
+data:
+  sample_hz: 10
+  relative_rotation: true
+
+sample:
+  every: 500
+  steps: 80
+  batch: 16
+  count: 4
+  playback_hz: 50
+
+checkpoint:
+  every: 500
+  keep_last: 3
+  resume: null
+
+swanlab:
+  project: genrl
+  name: ${name}-${model.name}
+  key: /mnt/workspace/btx0424/swanlab_key
+
+robot:
+  urdf: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/${name}-${model.name}/${now:%Y-%m-%d_%H-%M-%S}

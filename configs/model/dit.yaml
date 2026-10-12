@@ -1,0 +1,5 @@
+name: dit
+hidden: 256
+depth: 6
+heads: 8
+mlp_ratio: 4.0

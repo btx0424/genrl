@@ -1,0 +1,10 @@
+root: /mnt/workspace/btx0424/Weave
+split: test
+objects:
+  - smalltable
+  - largetable
+  - smallbox
+  - largebox
+duration: 1.0
+speed_threshold: 0.2
+sample_hz: null

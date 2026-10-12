@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+
+# Training artifacts. Checkpoints, GIFs, and SwanLab logs are regenerated.
+outputs/
+swanlog/
+runs/
+*.pt
+*.gif
+
+# Local link to G1 meshes. The URDF in this directory is tracked.
+assets/unitree_g1/meshes

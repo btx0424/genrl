@@ -1,0 +1,4 @@
+name: unet
+model_dim: 256
+kernel_size: 5
+upsample: linear
