@@ -1,4 +1,4 @@
-"""Train an unconditional diffusion model on fixed-length pre-interaction segments."""
+"""Train a shape-conditioned diffusion model on fixed-length pre-interaction segments."""
 
 from __future__ import annotations
 

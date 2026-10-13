@@ -42,7 +42,7 @@ Do not resume a checkpoint from an older representation. Feature scaling, the no
 
 Each run writes to `outputs/<model>/<timestamp>/`.
 
-- `samples/step_<step>/*.gif` are generated clips. Flow-matching clips are trained at 10 Hz and played back at 50 Hz. The robot is the G1 kinematic tree. The orange box is the object pose.
+- `samples/step_<step>/*.gif` are generated clips. Flow-matching clips are trained at 10 Hz and played back at 50 Hz. The network is conditioned on a frozen PointNet++ vector of the object mesh plus its extents. mujoco_warp draws the G1 meshes and that object mesh.
 - `checkpoints/last.pt` is the latest full state (weights, EMA, optimizer, normalization, step). `checkpoints/step_*.pt` keeps the last three periodic copies.
 - The same GIFs are uploaded to the SwanLab run under the `samples` key. The project page is https://swanlab.cn/@btx0424/genrl.
 

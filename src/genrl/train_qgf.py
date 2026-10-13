@@ -37,11 +37,13 @@ from genrl.train_common import (
     _start_swanlab,
     _update_ema,
     _weight_norms,
+    _guidance,
     build_backbone,
     load_raw_segments,
     set_seed,
 )
-from genrl.viz.render import ClipRenderer
+from genrl.data.geometry import object_shape_table
+from genrl.viz.warp_clips import WarpSampleRenderer
 
 
 def _scale_reward(
@@ -67,7 +69,11 @@ def _load_flow(path: str | None, device: torch.device) -> tuple[FlowMatching, di
             "Train one with scripts/train_flow_matching.py and pass its last.pt."
         )
     saved = OmegaConf.create(loaded["config"])
-    flow = FlowMatching(build_backbone(saved), t_eps=float(saved.t_eps))
+    flow = FlowMatching(
+        build_backbone(saved),
+        t_eps=float(saved.t_eps),
+        guidance=_guidance(saved),
+    )
     flow.load_state_dict(loaded["ema"])
     flow.to(device).eval()
     for parameter in flow.parameters():
@@ -154,7 +160,7 @@ def train(cfg: DictConfig) -> None:
     checkpoint_dir = output_dir / "checkpoints"
     sample_dir = output_dir / "samples"
     flow, flow_checkpoint, flow_config = _load_flow(cfg.flow, device)
-    raw, fps, rotation_anchors, skip_tail = load_raw_segments(cfg)
+    raw, fps, rotation_anchors, skip_tail, object_names = load_raw_segments(cfg)
     _check_flow_data(flow_config, cfg, raw, fps)
     config = _public_config(cfg)
     config["fps"] = fps
@@ -217,8 +223,9 @@ def train(cfg: DictConfig) -> None:
     guidance = float(cfg.guidance)
     cond_steps = int(flow_config.cond_steps)
 
+    shapes = object_shape_table(Path(cfg.data.root), object_names)
     loader = DataLoader(
-        TensorDataset(features, reward),
+        TensorDataset(features, shapes, reward),
         batch_size=min(int(cfg.batch_size), features.shape[0]),
         shuffle=True,
         drop_last=features.shape[0] >= int(cfg.batch_size),
@@ -226,7 +233,7 @@ def train(cfg: DictConfig) -> None:
     real_consistency = position_velocity_consistency(raw, fps)
     real_rot6d = rot6d_gram_error(raw)
     real_motion = object_motion_before_touch(raw, skip_tail=skip_tail)
-    renderer = ClipRenderer(cfg.robot.urdf)
+    renderer = WarpSampleRenderer(cfg.data.root, cfg.robot.urdf)
     _start_swanlab(cfg, config)
     print(
         f"training {cfg.swanlab.name} on {features.shape[0]} clips "
@@ -262,16 +269,22 @@ def train(cfg: DictConfig) -> None:
     keep_last = int(cfg.checkpoint.keep_last)
     try:
         while step < int(cfg.steps):
-            for batch, batch_reward in loader:
+            for batch, batch_geom, batch_reward in loader:
                 step += 1
                 batch = batch.to(device)
+                batch_geom = batch_geom.to(device)
                 batch_reward = batch_reward.to(device)
                 q_loss, v_loss = critic.losses(batch, batch, batch_reward)
                 q_gen = torch.zeros((), device=device)
                 gen_reward_value = torch.zeros((), device=device)
                 if generated_weight > 0 and generated_steps > 0:
                     prefix = batch[:, :cond_steps] if cond_steps else None
-                    generated = flow.sample(tuple(batch.shape), steps=generated_steps, prefix=prefix)
+                    generated = flow.sample(
+                        tuple(batch.shape),
+                        steps=generated_steps,
+                        prefix=prefix,
+                        geom=batch_geom,
+                    )
                     physical_reward = combined_reward(
                         clip_penalties(generated * std + mean, fps, skip_tail),
                         scales,
@@ -327,7 +340,7 @@ def train(cfg: DictConfig) -> None:
                     running = {key: 0.0 for key in running}
                     seen = 0
                 if step % int(cfg.sample.every) == 0 or step == int(cfg.steps):
-                    prefix, anchor = _sample_condition(
+                    prefix, anchor, index = _sample_condition(
                         features,
                         rotation_anchors,
                         int(cfg.sample.batch),
@@ -337,10 +350,13 @@ def train(cfg: DictConfig) -> None:
                     length = int(features.shape[1])
                     sample_steps = int(cfg.sample.steps)
 
+                    geom = shapes[index].to(device)
+
                     def generate(
                         prefix=prefix,
                         length=length,
                         sample_steps=sample_steps,
+                        geom=geom,
                     ):
                         return qgf_sample(
                             flow,
@@ -353,6 +369,7 @@ def train(cfg: DictConfig) -> None:
                             steps=sample_steps,
                             guidance=guidance,
                             prefix=prefix,
+                            geom=geom,
                         )
 
                     _log_samples(
@@ -370,11 +387,13 @@ def train(cfg: DictConfig) -> None:
                         else fps,
                         sample_dir / f"step_{step:07d}",
                         renderer,
+                        object_names,
+                        shapes,
                         real_consistency,
                         real_rot6d,
                         real_motion,
                         skip_tail,
-                        (prefix, anchor),
+                        (prefix, anchor, index),
                         generate=generate,
                     )
                 if step % int(cfg.checkpoint.every) == 0 and step != int(cfg.steps):

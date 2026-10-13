@@ -2,8 +2,9 @@
 Minimal modules shared by Diffusion and Flow Matching models.
 
 For fixed-length segments, a 1D U-Net over time is a fair baseline.
-Both models call it as ``network(x, t)`` with ``x`` shaped ``(B, T, D)`` and a
-continuous time ``t`` shaped ``(B,)`` in ``[0, 1]``.
+Both models call it as ``network(x, t, geom)`` with ``x`` shaped ``(B, T, D)``
+and a continuous time ``t`` shaped ``(B,)`` in ``[0, 1]``. ``geom`` is the
+frozen object vector, or ``None`` for the unconditional branch.
 """
 
 from __future__ import annotations
@@ -29,6 +30,42 @@ def _upsample_mode(name: str) -> str:
         choices = "nearest, linear, conv_transpose, pixel_shuffle"
         raise ValueError(f"upsample must be one of {choices}, got {name!r}.")
     return modes[key]
+
+
+class ShapeConditioner(nn.Module):
+    """Map a frozen object vector into the time embedding.
+
+    The last linear layer starts at zero, so a fresh network ignores the
+    object. Dropped rows, and a missing vector, use one learned null token.
+    That token is the unconditional side of classifier-free guidance.
+    """
+
+    def __init__(self, shape_dim: int, cond_dim: int, drop: float):
+        super().__init__()
+        if shape_dim < 1:
+            raise ValueError(f"shape_dim must be positive, got {shape_dim}.")
+        if not 0.0 <= drop < 1.0:
+            raise ValueError(f"shape drop must lie in [0, 1), got {drop}.")
+        self.drop = float(drop)
+        self.proj = nn.Sequential(
+            nn.Linear(shape_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
+        self.null = nn.Parameter(torch.zeros(cond_dim))
+
+    def forward(self, shape: torch.Tensor | None, batch: int) -> torch.Tensor:
+        if shape is None:
+            return self.null.expand(batch, -1)
+        if shape.ndim != 2 or shape.shape[0] != batch:
+            raise ValueError(f"shape must be ({batch}, dim), got {tuple(shape.shape)}.")
+        cond = self.proj(shape)
+        if self.training and self.drop > 0.0:
+            drop = torch.rand(batch, device=shape.device) < self.drop
+            cond = torch.where(drop[:, None], self.null.expand_as(cond), cond)
+        return cond
 
 
 def _groups(channels: int) -> int:
@@ -137,6 +174,8 @@ class TemporalUNet(nn.Module):
         time_dim: int = 256,
         kernel_size: int = 3,
         upsample: str = "nearest",
+        shape_dim: int = 1027,
+        shape_drop: float = 0.1,
     ):
         super().__init__()
         if not multipliers:
@@ -153,6 +192,7 @@ class TemporalUNet(nn.Module):
             nn.SiLU(),
             nn.Linear(time_dim * 4, time_dim),
         )
+        self.shape_cond = ShapeConditioner(shape_dim, time_dim, shape_drop)
         self.in_conv = nn.Conv1d(data_dim, channels[0], kernel_size=kernel_size, padding=padding)
 
         self.down = nn.ModuleList()
@@ -198,8 +238,8 @@ class TemporalUNet(nn.Module):
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        temb = self.time_mlp(self.time_emb(t))
+    def forward(self, x: torch.Tensor, t: torch.Tensor, geom: torch.Tensor | None = None) -> torch.Tensor:
+        temb = self.time_mlp(self.time_emb(t)) + self.shape_cond(geom, x.shape[0])
         h = self.in_conv(x.transpose(1, 2))
         skips: list[torch.Tensor] = []
         for level, blocks in enumerate(self.down):

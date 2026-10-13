@@ -157,6 +157,7 @@ def qgf_sample(
     steps: int = 80,
     guidance: float = 0.1,
     prefix: torch.Tensor | None = None,
+    geom: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Euler integration with the QGF velocity ``v + guidance * grad Q``.
 
@@ -179,6 +180,8 @@ def qgf_sample(
         prefix = prefix.to(device=device, dtype=dtype)
         cond = int(prefix.shape[1])
         x[:, :cond] = prefix
+    if geom is not None:
+        geom = geom.to(device=device, dtype=dtype)
     ts = torch.linspace(flow.t_eps, 1.0 - flow.t_eps, steps, device=device, dtype=dtype)
     dt = ts[1] - ts[0] if steps > 1 else (1.0 - 2.0 * flow.t_eps)
     with torch.enable_grad():
@@ -186,7 +189,7 @@ def qgf_sample(
             t_value = float(t_scalar)
             t = torch.full((shape[0],), t_value, device=device, dtype=dtype)
             with torch.no_grad():
-                velocity = flow.model(x, t)
+                velocity = flow.predict(x, t, geom)
                 if cond:
                     velocity = velocity.clone()
                     velocity[:, :cond] = 0

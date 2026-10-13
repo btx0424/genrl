@@ -1,5 +1,5 @@
 """
-Simple unconditional diffusion model.
+Shape-conditioned diffusion model.
 
 Epsilon-prediction DDPM with a linear noise schedule. Sampling uses DDIM.
 """
@@ -39,12 +39,15 @@ class GaussianDiffusion(nn.Module):
     clean clip in the loss and are written back after every DDIM step.
     """
 
-    def __init__(self, model: nn.Module, timesteps: int = 1000):
+    def __init__(self, model: nn.Module, timesteps: int = 1000, guidance: float = 1.25):
         super().__init__()
         if timesteps < 2:
             raise ValueError(f"timesteps must be at least 2, got {timesteps}.")
+        if guidance < 0.0:
+            raise ValueError(f"guidance must be non-negative, got {guidance}.")
         self.model = model
         self.num_timesteps = timesteps
+        self.guidance = float(guidance)
         betas = linear_beta_schedule(timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -68,10 +71,18 @@ class GaussianDiffusion(nn.Module):
             x_t[:, :cond_steps] = x0[:, :cond_steps]
         return x_t, noise, t.float() / self.num_timesteps
 
-    def loss(self, x0: torch.Tensor, cond_steps: int = 0) -> torch.Tensor:
+    def predict(self, x: torch.Tensor, t: torch.Tensor, geom: torch.Tensor | None = None) -> torch.Tensor:
+        """Noise prediction. ``geom is None`` is the unconditional branch."""
+        if geom is None or self.guidance == 1.0:
+            return self.model(x, t, geom)
+        conditional = self.model(x, t, geom)
+        unconditional = self.model(x, t, None)
+        return unconditional + self.guidance * (conditional - unconditional)
+
+    def loss(self, x0: torch.Tensor, cond_steps: int = 0, geom: torch.Tensor | None = None) -> torch.Tensor:
         """Noise loss. The first ``cond_steps`` frames stay equal to ``x0`` and are not scored."""
         x_t, noise, t_frac = self.corrupt(x0, cond_steps)
-        pred = self.model(x_t, t_frac)
+        pred = self.model(x_t, t_frac, geom)
         return _noise_error(pred, noise, cond_steps).mean()
 
     @torch.no_grad()
@@ -80,6 +91,7 @@ class GaussianDiffusion(nn.Module):
         shape: tuple[int, ...],
         steps: int = 80,
         prefix: torch.Tensor | None = None,
+        geom: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """DDIM sample (eta = 0). ``prefix`` is a clean normalized first-frame block."""
         if steps < 2:
@@ -100,9 +112,13 @@ class GaussianDiffusion(nn.Module):
                 raise ValueError("prefix must be shorter than the generated clip.")
             prefix = prefix.to(device=device, dtype=dtype)
             x[:, : prefix.shape[1]] = prefix
+        if geom is not None:
+            geom = geom.to(device=device, dtype=dtype)
+            if geom.shape[0] != shape[0]:
+                raise ValueError(f"geom batch {geom.shape[0]} does not match {shape[0]}.")
         for i, t_value in enumerate(idx):
             t = torch.full((shape[0],), int(t_value), device=device, dtype=torch.long)
-            pred = self.model(x, t.float() / self.num_timesteps)
+            pred = self.predict(x, t.float() / self.num_timesteps, geom)
             abar = _extract(self.alphas_cumprod, t, x)
             x0 = (x - torch.sqrt(1.0 - abar) * pred) / torch.sqrt(abar).clamp_min(1e-8)
             prev = int(idx[i + 1]) if i + 1 < len(idx) else -1

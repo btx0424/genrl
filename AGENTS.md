@@ -45,6 +45,6 @@ uv run python scripts/train_awd.py diffusion=outputs/diffusion-dit/<run>/checkpo
 uv run python -m genrl.data.view --split test --objects smallbox
 ```
 
-GIFs: `outputs/flow_matching/<timestamp>/samples/step_<step>/*.gif`. The same files are the SwanLab `samples` videos. Project: https://swanlab.cn/@btx0424/genrl.
+GIFs: `outputs/flow_matching/<timestamp>/samples/step_<step>/*.gif`, rendered with mujoco_warp (G1 meshes and the object mesh). The same files are the SwanLab `samples` videos. Project: https://swanlab.cn/@btx0424/genrl.
 
 Do not print the SwanLab API key. It is only in the key file named by `swanlab.key`.

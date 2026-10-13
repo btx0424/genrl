@@ -12,10 +12,11 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
+from genrl.data.geometry import object_shape_table
 from genrl.data.segments import FEATURE_DIM, clip_penalties
 from genrl.model.flow_matching import FlowMatching
 from genrl.model.qgf import IQL, qgf_sample
-from genrl.train_common import build_backbone, load_raw_segments
+from genrl.train_common import _guidance, build_backbone, load_raw_segments
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_GUIDANCE = (0.0, 0.1, 1.0, 3.0, 10.0, 30.0, 100.0)
@@ -46,7 +47,11 @@ def _load(checkpoint: Path, device: torch.device):
         raise FileNotFoundError(f"Flow checkpoint recorded in the QGF run is missing: {flow_path}")
     flow_saved = torch.load(flow_path, map_location="cpu", weights_only=False)
     flow_config = OmegaConf.create(flow_saved["config"])
-    flow = FlowMatching(build_backbone(flow_config), t_eps=float(flow_config.t_eps))
+    flow = FlowMatching(
+        build_backbone(flow_config),
+        t_eps=float(flow_config.t_eps),
+        guidance=_guidance(flow_config),
+    )
     flow.load_state_dict(saved["flow"])
     flow.to(device).eval()
     for parameter in flow.parameters():
@@ -81,7 +86,10 @@ def main() -> None:
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     checkpoint = args.checkpoint or _latest_checkpoint()
     saved, config, flow_config, flow, critic = _load(checkpoint, device)
-    raw, fps, _anchors, skip_tail = load_raw_segments(OmegaConf.create({"data": config.data}))
+    raw, fps, _anchors, skip_tail, object_names = load_raw_segments(
+        OmegaConf.create({"data": config.data})
+    )
+    shapes = object_shape_table(Path(config.data.root), object_names)
     mean = saved["mean"].to(device)
     std = saved["std"].to(device)
     features = (raw - saved["mean"]) / saved["std"]
@@ -113,6 +121,7 @@ def main() -> None:
                 steps=args.steps,
                 guidance=weight,
                 prefix=prefix,
+                geom=shapes[index].to(device),
             )
             physical = sample * std + mean
             penalties = clip_penalties(physical.detach(), fps, skip_tail)

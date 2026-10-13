@@ -37,11 +37,13 @@ from genrl.train_common import (
     _start_swanlab,
     _update_ema,
     _weight_norms,
+    _guidance,
     build_backbone,
     load_raw_segments,
     set_seed,
 )
-from genrl.viz.render import ClipRenderer
+from genrl.data.geometry import object_shape_table
+from genrl.viz.warp_clips import WarpSampleRenderer
 
 
 def advantage_weights(reward: torch.Tensor, beta: float, weight_max: float) -> torch.Tensor:
@@ -79,7 +81,11 @@ def _load_diffusion(
             "Train one with scripts/train_diffusion.py and pass its last.pt."
         )
     saved = OmegaConf.create(loaded["config"])
-    model = GaussianDiffusion(build_backbone(saved), timesteps=int(saved.timesteps))
+    model = GaussianDiffusion(
+        build_backbone(saved),
+        timesteps=int(saved.timesteps),
+        guidance=_guidance(saved),
+    )
     model.load_state_dict(loaded["ema"])
     model.to(device)
     print(
@@ -161,7 +167,7 @@ def train(cfg: DictConfig) -> None:
     checkpoint_dir = output_dir / "checkpoints"
     sample_dir = output_dir / "samples"
     module, loaded_init, saved = _load_diffusion(cfg.diffusion, device)
-    raw, fps, rotation_anchors, skip_tail = load_raw_segments(cfg)
+    raw, fps, rotation_anchors, skip_tail, object_names = load_raw_segments(cfg)
     _check_data(saved, cfg, raw, fps)
     config = _public_config(cfg)
     config["fps"] = fps
@@ -207,6 +213,7 @@ def train(cfg: DictConfig) -> None:
     mean = mean.to(device)
     std = std.to(device)
     features = features.to(device)
+    shapes = object_shape_table(Path(cfg.data.root), object_names).to(device)
     scales = {name: value.to(device) for name, value in scales.items()}
     beta = float(cfg.beta)
     bc_weight = float(cfg.bc_weight)
@@ -219,7 +226,7 @@ def train(cfg: DictConfig) -> None:
     real_consistency = position_velocity_consistency(raw, fps)
     real_rot6d = rot6d_gram_error(raw)
     real_motion = object_motion_before_touch(raw, skip_tail=skip_tail)
-    renderer = ClipRenderer(cfg.robot.urdf)
+    renderer = WarpSampleRenderer(cfg.data.root, cfg.robot.urdf)
     _start_swanlab(cfg, config)
     print(
         f"fine-tuning {cfg.swanlab.name} on {features.shape[0]} clips "
@@ -242,15 +249,14 @@ def train(cfg: DictConfig) -> None:
     try:
         while step < int(cfg.steps):
             step += 1
-            if cond_steps:
-                index = torch.randint(0, features.shape[0], (batch_size,), device=device)
-                prefix = features[index, :cond_steps]
-            else:
-                prefix = None
+            index = torch.randint(0, features.shape[0], (batch_size,), device=device)
+            prefix = features[index, :cond_steps] if cond_steps else None
+            geom = shapes[index]
             sampled = ema.sample(
                 (batch_size, length, FEATURE_DIM),
                 steps=rollout_steps,
                 prefix=prefix,
+                geom=geom,
             )
             reward = combined_reward(
                 clip_penalties(sampled * std + mean, fps, skip_tail),
@@ -258,11 +264,11 @@ def train(cfg: DictConfig) -> None:
             )
             weights = advantage_weights(reward, beta, weight_max)
             x_t, noise, t_frac = module.corrupt(sampled, cond_steps)
-            pred = module.model(x_t, t_frac)
+            pred = module.model(x_t, t_frac, geom)
             denoising = _noise_error(pred, noise, cond_steps)
             weighted = (weights.detach() * denoising).mean()
             with torch.no_grad():
-                reference = teacher.model(x_t, t_frac)
+                reference = teacher.model(x_t, t_frac, geom)
             behavior = _noise_error(pred, reference, cond_steps).mean()
             loss = weighted + bc_weight * behavior
             optimizer.zero_grad(set_to_none=True)
@@ -319,6 +325,8 @@ def train(cfg: DictConfig) -> None:
                     else fps,
                     sample_dir / f"step_{step:07d}",
                     renderer,
+                    object_names,
+                    shapes,
                     real_consistency,
                     real_rot6d,
                     real_motion,

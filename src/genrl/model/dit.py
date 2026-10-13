@@ -12,7 +12,7 @@ import math
 import torch
 from torch import nn
 
-from genrl.model.modules import SinusoidalTimeEmbedding
+from genrl.model.modules import ShapeConditioner, SinusoidalTimeEmbedding
 
 
 def _sinusoidal_position(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -65,6 +65,8 @@ class MotionDiT(nn.Module):
         depth: int = 6,
         heads: int = 8,
         mlp_ratio: float = 4.0,
+        shape_dim: int = 1027,
+        shape_drop: float = 0.1,
     ):
         super().__init__()
         if depth < 1:
@@ -76,6 +78,7 @@ class MotionDiT(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, hidden),
         )
+        self.shape_cond = ShapeConditioner(shape_dim, hidden, shape_drop)
         self.blocks = nn.ModuleList(_DiTBlock(hidden, heads, mlp_ratio) for _ in range(depth))
         self.final_norm = nn.LayerNorm(hidden, elementwise_affine=False, eps=1e-6)
         self.final_ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden, 2 * hidden))
@@ -85,8 +88,8 @@ class MotionDiT(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        cond = self.time_mlp(self.time_emb(t))
+    def forward(self, x: torch.Tensor, t: torch.Tensor, geom: torch.Tensor | None = None) -> torch.Tensor:
+        cond = self.time_mlp(self.time_emb(t)) + self.shape_cond(geom, x.shape[0])
         h = self.input(x)
         h = h + _sinusoidal_position(h.shape[1], h.shape[2], h.device, h.dtype)
         for block in self.blocks:

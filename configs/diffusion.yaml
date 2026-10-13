@@ -15,6 +15,9 @@ log_every: 20
 timesteps: 1000
 ema_decay: 0.999
 cond_steps: 1
+geom:
+  drop: 0.1
+  guidance: 1.25
 
 data:
   sample_hz: 10
@@ -34,7 +37,7 @@ checkpoint:
 
 swanlab:
   project: genrl
-  name: ${name}-${model.name}
+  name: ${name}-${model.name}-geom
   key: /mnt/workspace/btx0424/swanlab_key
 
 robot:
@@ -44,4 +47,4 @@ hydra:
   job:
     chdir: false
   run:
-    dir: outputs/${name}-${model.name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: outputs/${name}-${model.name}-geom/${now:%Y-%m-%d_%H-%M-%S}

@@ -26,12 +26,14 @@ from genrl.data.segments import (
     project_rot6d,
     rot6d_gram_error,
 )
+from genrl.data.geometry import SHAPE_DIM, object_shape_table
 from genrl.data.weave import WeavePreInteractionDataset
 from genrl.model.diffusion import GaussianDiffusion
 from genrl.model.dit import MotionDiT
 from genrl.model.flow_matching import FlowMatching
 from genrl.model.modules import TemporalUNet
-from genrl.viz.render import ClipRenderer, expand_time, write_sample_gifs
+from genrl.viz.render import expand_time
+from genrl.viz.warp_clips import WarpSampleRenderer
 
 
 def set_seed(seed: int) -> None:
@@ -41,12 +43,15 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_raw_segments(cfg: DictConfig) -> tuple[torch.Tensor, int, torch.Tensor | None, int]:
-    """Unnormalized segments, their rate, rotation anchors, and onset frames to skip.
+def load_raw_segments(
+    cfg: DictConfig,
+) -> tuple[torch.Tensor, int, torch.Tensor | None, int, np.ndarray]:
+    """Unnormalized segments, their rate, rotation anchors, onset skip, and object names.
 
-    The last item is 1 when the clip still ends on the interaction onset, and 0
+    The onset skip is 1 when the clip still ends on the interaction onset, and 0
     when stride subsampling dropped that frame. The object-still reward uses it
-    so a touched frame is not penalized for moving.
+    so a touched frame is not penalized for moving. Object names line up with
+    the clip axis and choose the mesh drawn in the sample GIFs.
     """
     data = cfg.data
     dataset = WeavePreInteractionDataset(
@@ -56,6 +61,7 @@ def load_raw_segments(cfg: DictConfig) -> tuple[torch.Tensor, int, torch.Tensor 
         duration_s=data.duration,
         speed_threshold=data.speed_threshold,
     )
+    object_names = np.asarray(dataset.object_names)
     features = torch.from_numpy(clips_to_features(dataset))
     if features.shape[-1] != FEATURE_DIM:
         raise ValueError(f"Expected feature dim {FEATURE_DIM}, got {features.shape[-1]}.")
@@ -64,7 +70,7 @@ def load_raw_segments(cfg: DictConfig) -> tuple[torch.Tensor, int, torch.Tensor 
     native_length = int(features.shape[1])
     if sample_hz is None:
         stored, fps, anchors = _with_relative_rotations(data, features, native_hz)
-        return stored, fps, anchors, 1
+        return stored, fps, anchors, 1, object_names
     sample_hz = int(sample_hz)
     if native_hz % sample_hz != 0:
         raise ValueError(f"Dataset rate {native_hz} Hz is not divisible by sample_hz {sample_hz}.")
@@ -78,7 +84,7 @@ def load_raw_segments(cfg: DictConfig) -> tuple[torch.Tensor, int, torch.Tensor 
         flush=True,
     )
     stored, fps, anchors = _with_relative_rotations(data, features, sample_hz)
-    return stored, fps, anchors, skip_tail
+    return stored, fps, anchors, skip_tail, object_names
 
 
 def _with_relative_rotations(
@@ -106,10 +112,23 @@ def _normalize(features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torc
     return (features - mean) / std, mean, std
 
 
+def _shape_drop(cfg: DictConfig) -> float:
+    if "geom" in cfg and "drop" in cfg.geom:
+        return float(cfg.geom.drop)
+    return 0.1
+
+
+def _guidance(cfg: DictConfig) -> float:
+    if "geom" in cfg and "guidance" in cfg.geom:
+        return float(cfg.geom.guidance)
+    return 1.25
+
+
 def build_backbone(cfg: DictConfig) -> nn.Module:
     """The temporal network, without the flow-matching or diffusion wrapper."""
     architecture = cfg.model
     backbone = str(architecture.name)
+    drop = _shape_drop(cfg)
     if backbone == "dit":
         network = MotionDiT(
             FEATURE_DIM,
@@ -117,6 +136,8 @@ def build_backbone(cfg: DictConfig) -> nn.Module:
             depth=int(architecture.depth),
             heads=int(architecture.heads),
             mlp_ratio=float(architecture.mlp_ratio),
+            shape_dim=SHAPE_DIM,
+            shape_drop=drop,
         )
     elif backbone == "unet":
         network = TemporalUNet(
@@ -124,6 +145,8 @@ def build_backbone(cfg: DictConfig) -> nn.Module:
             model_dim=int(architecture.model_dim),
             kernel_size=int(architecture.kernel_size),
             upsample=str(architecture.upsample),
+            shape_dim=SHAPE_DIM,
+            shape_drop=drop,
         )
     else:
         raise ValueError(f"model.name must be 'unet' or 'dit', got {backbone!r}.")
@@ -135,9 +158,9 @@ def build_backbone(cfg: DictConfig) -> nn.Module:
 def build_model(cfg: DictConfig) -> nn.Module:
     network = build_backbone(cfg)
     if cfg.name == "diffusion":
-        return GaussianDiffusion(network, timesteps=cfg.timesteps)
+        return GaussianDiffusion(network, timesteps=cfg.timesteps, guidance=_guidance(cfg))
     if cfg.name == "flow_matching":
-        return FlowMatching(network, t_eps=float(cfg.t_eps))
+        return FlowMatching(network, t_eps=float(cfg.t_eps), guidance=_guidance(cfg))
     raise ValueError(f"Unknown model {cfg.name!r}.")
 
 
@@ -311,13 +334,18 @@ def _sample_condition(
     batch: int,
     cond_steps: int,
     device: torch.device,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    if cond_steps == 0:
-        return None, None
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    """Prefix, rotation anchor, and the dataset row each sample was drawn from.
+
+    The row picks the object mesh. With no inpainting prefix the motion is
+    unconditional, and the row is still used so the GIF shows a real mesh.
+    """
     index = torch.randint(0, features.shape[0], (batch,))
+    if cond_steps == 0:
+        return None, None, index
     prefix = features[index, :cond_steps].to(device)
     anchor = None if anchors is None else anchors[index].to(device)
-    return prefix, anchor
+    return prefix, anchor, index
 
 
 def _prefixed(metrics: dict[str, float], prefix: str) -> dict[str, float]:
@@ -341,7 +369,7 @@ def train(cfg: DictConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     checkpoint_dir = output_dir / "checkpoints"
     sample_dir = output_dir / "samples"
-    raw, fps, rotation_anchors, skip_tail = load_raw_segments(cfg)
+    raw, fps, rotation_anchors, skip_tail, object_names = load_raw_segments(cfg)
     config = _public_config(cfg)
     config["fps"] = fps
     config["feature_dim"] = FEATURE_DIM
@@ -380,8 +408,14 @@ def train(cfg: DictConfig) -> None:
         print(f"resumed at step {start}", flush=True)
     ema_decay = float(cfg.ema_decay)
 
+    shapes = object_shape_table(Path(cfg.data.root), object_names)
+    print(
+        f"object shape {SHAPE_DIM}: PointNet++ unit vector plus mesh extents, "
+        f"drop {_shape_drop(cfg):.2f}, guidance {_guidance(cfg):.2f}",
+        flush=True,
+    )
     loader = DataLoader(
-        TensorDataset(features),
+        TensorDataset(features, shapes),
         batch_size=min(int(cfg.batch_size), features.shape[0]),
         shuffle=True,
         drop_last=features.shape[0] >= int(cfg.batch_size),
@@ -390,7 +424,7 @@ def train(cfg: DictConfig) -> None:
     real_rot6d = rot6d_gram_error(raw)
     real_motion = object_motion_before_touch(raw, skip_tail=skip_tail)
     cond_steps = int(cfg.cond_steps) if "cond_steps" in cfg else 0
-    renderer = ClipRenderer(cfg.robot.urdf)
+    renderer = WarpSampleRenderer(cfg.data.root, cfg.robot.urdf)
     _start_swanlab(cfg, config)
     print(
         f"training {cfg.swanlab.name} on {features.shape[0]} clips "
@@ -424,13 +458,14 @@ def train(cfg: DictConfig) -> None:
     seen = 0
     try:
         while step < int(cfg.steps):
-            for (batch,) in loader:
+            for batch, batch_geom in loader:
                 step += 1
                 batch = batch.to(device)
+                batch_geom = batch_geom.to(device)
                 if cond_steps:
-                    loss = module.loss(batch, cond_steps=cond_steps)
+                    loss = module.loss(batch, cond_steps=cond_steps, geom=batch_geom)
                 else:
-                    loss = module.loss(batch)
+                    loss = module.loss(batch, geom=batch_geom)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if cfg.grad_clip > 0:
@@ -479,6 +514,8 @@ def train(cfg: DictConfig) -> None:
                         int(cfg.sample.playback_hz) if "playback_hz" in cfg.sample and cfg.sample.playback_hz else fps,
                         sample_dir / f"step_{step:07d}",
                         renderer,
+                        object_names,
+                        shapes,
                         real_consistency,
                         real_rot6d,
                         real_motion,
@@ -515,12 +552,14 @@ def _log_samples(
     count: int,
     playback_hz: int,
     directory: Path,
-    renderer: ClipRenderer,
+    renderer: WarpSampleRenderer,
+    object_names: np.ndarray,
+    shapes: torch.Tensor,
     real_consistency: dict[str, float],
     real_rot6d: dict[str, float],
     real_motion: dict[str, float],
     skip_tail: int,
-    condition: tuple[torch.Tensor | None, torch.Tensor | None],
+    condition: tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor],
     generate=None,
 ) -> None:
     """Log one batch of samples. ``generate`` returns normalized clips when set.
@@ -528,18 +567,22 @@ def _log_samples(
     The default draws from ``module.sample``. A guided sampler can replace that
     without changing the metrics or the GIFs.
     """
-    prefix, anchor = condition
+    prefix, anchor, index = condition
     training = module.training
     module.eval()
     with torch.no_grad():
+        geom = shapes[index].to(next(module.parameters()).device)
         if generate is None:
             if prefix is None:
-                generated = module.sample((batch, length, FEATURE_DIM), steps=sample_steps)
+                generated = module.sample(
+                    (batch, length, FEATURE_DIM), steps=sample_steps, geom=geom
+                )
             else:
                 generated = module.sample(
                     (batch, length, FEATURE_DIM),
                     steps=sample_steps,
                     prefix=prefix,
+                    geom=geom,
                 )
         else:
             generated = generate()
@@ -553,7 +596,8 @@ def _log_samples(
     if anchor is not None:
         shown = compose_rotation_anchor(shown, anchor[:count])
     clips = expand_time(shown.detach().cpu().numpy(), fps, playback_hz)
-    paths = write_sample_gifs(clips, directory, playback_hz, renderer=renderer)
+    names = object_names[index[: clips.shape[0]].detach().cpu().numpy()]
+    paths = renderer.write_gifs(clips, names, directory, playback_hz)
     captions = [f"step {step} sample {index}" for index in range(len(paths))]
     swanlab.log(
         {

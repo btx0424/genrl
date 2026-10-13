@@ -1,4 +1,4 @@
-"""Train an unconditional flow-matching model on fixed-length pre-interaction segments."""
+"""Train a shape-conditioned flow-matching model on fixed-length pre-interaction segments."""
 
 from __future__ import annotations
 
