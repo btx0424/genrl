@@ -29,6 +29,31 @@ class FlowMatching(nn.Module):
         self.t_eps = float(t_eps)
         self.guidance = float(guidance)
 
+    def time_grid(self, steps: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Times from ``t_eps`` to ``1 - t_eps``. ``steps`` is the number of nodes.
+
+        Euler takes ``steps - 1`` updates and lands on the last node. A single
+        step is the whole interval.
+        """
+        if steps < 1:
+            raise ValueError(f"steps must be positive, got {steps}.")
+        if steps == 1:
+            return torch.tensor([self.t_eps, 1.0 - self.t_eps], device=device, dtype=dtype)
+        return torch.linspace(self.t_eps, 1.0 - self.t_eps, steps, device=device, dtype=dtype)
+
+    def _pinned_velocity(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        geom: torch.Tensor | None,
+        cond_steps: int,
+    ) -> torch.Tensor:
+        velocity = self.predict(x, t, geom)
+        if cond_steps:
+            velocity = velocity.clone()
+            velocity[:, :cond_steps] = 0
+        return velocity
+
     def predict(self, x: torch.Tensor, t: torch.Tensor, geom: torch.Tensor | None = None) -> torch.Tensor:
         """Velocity. ``geom is None`` is the unconditional branch.
 
@@ -69,17 +94,27 @@ class FlowMatching(nn.Module):
         steps: int = 80,
         prefix: torch.Tensor | None = None,
         geom: torch.Tensor | None = None,
+        source: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Integrate ``dx/dt = v_theta`` from ``t_eps`` to ``1 - t_eps``.
 
-        ``prefix`` is a clean normalized ``(batch, cond_steps, feature)`` block.
-        It is written back after every Euler step so the first frames stay observed.
+        ``steps`` is the number of time nodes, so the integrator takes
+        ``steps - 1`` Euler updates and stops on the last node. ``prefix`` is a
+        clean normalized ``(batch, cond_steps, feature)`` block, written back
+        after every update. ``source`` is the state at ``t_eps``; a missing
+        source is fresh Gaussian noise.
         """
         if steps < 1:
             raise ValueError(f"steps must be positive, got {steps}.")
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
-        x = torch.randn(shape, device=device, dtype=dtype)
+        if source is None:
+            x = torch.randn(shape, device=device, dtype=dtype)
+        else:
+            if tuple(source.shape) != tuple(shape):
+                raise ValueError(f"source shape {tuple(source.shape)} does not match {shape}.")
+            x = source.to(device=device, dtype=dtype).clone()
+        cond = 0
         if prefix is not None:
             if prefix.ndim != 3 or prefix.shape[0] != shape[0] or prefix.shape[2] != shape[2]:
                 raise ValueError(
@@ -88,20 +123,62 @@ class FlowMatching(nn.Module):
             if prefix.shape[1] >= shape[1]:
                 raise ValueError("prefix must be shorter than the generated clip.")
             prefix = prefix.to(device=device, dtype=dtype)
-            x[:, : prefix.shape[1]] = prefix
+            cond = int(prefix.shape[1])
+            x[:, :cond] = prefix
         if geom is not None:
             geom = geom.to(device=device, dtype=dtype)
             if geom.shape[0] != shape[0]:
                 raise ValueError(f"geom batch {geom.shape[0]} does not match {shape[0]}.")
-        ts = torch.linspace(self.t_eps, 1.0 - self.t_eps, steps, device=device, dtype=dtype)
-        dt = ts[1] - ts[0] if steps > 1 else (1.0 - 2.0 * self.t_eps)
-        for t_scalar in ts:
-            t = torch.full((shape[0],), float(t_scalar), device=device, dtype=dtype)
-            velocity = self.predict(x, t, geom)
-            if prefix is not None:
-                velocity = velocity.clone()
-                velocity[:, : prefix.shape[1]] = 0
-            x = x + dt * velocity
-            if prefix is not None:
-                x[:, : prefix.shape[1]] = prefix
+        ts = self.time_grid(steps, device, dtype)
+        for i in range(ts.shape[0] - 1):
+            t = torch.full((shape[0],), float(ts[i]), device=device, dtype=dtype)
+            velocity = self._pinned_velocity(x, t, geom, cond)
+            x = x + (ts[i + 1] - ts[i]) * velocity
+            if cond:
+                x[:, :cond] = prefix
+        return x
+
+    @torch.no_grad()
+    def invert(
+        self,
+        clip: torch.Tensor,
+        steps: int = 80,
+        prefix: torch.Tensor | None = None,
+        geom: torch.Tensor | None = None,
+        iters: int = 12,
+    ) -> torch.Tensor:
+        """Recover the ``t_eps`` state that ``sample`` would integrate to ``clip``.
+
+        Each Euler update ``x_next = x + dt v(x, t)`` is solved for ``x`` by
+        fixed-point iteration. Twelve evaluations per step recover the training
+        sampler's noise to about 1e-5.
+        """
+        if iters < 1:
+            raise ValueError(f"iters must be positive, got {iters}.")
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        x = clip.to(device=device, dtype=dtype).clone()
+        cond = 0
+        if prefix is not None:
+            if prefix.shape[0] != x.shape[0] or prefix.shape[2] != x.shape[2]:
+                raise ValueError(
+                    f"prefix shape {tuple(prefix.shape)} does not match clip {tuple(x.shape)}."
+                )
+            prefix = prefix.to(device=device, dtype=dtype)
+            cond = int(prefix.shape[1])
+            x[:, :cond] = prefix
+        if geom is not None:
+            geom = geom.to(device=device, dtype=dtype)
+            if geom.shape[0] != x.shape[0]:
+                raise ValueError(f"geom batch {geom.shape[0]} does not match {x.shape[0]}.")
+        ts = self.time_grid(steps, device, dtype)
+        for i in range(ts.shape[0] - 2, -1, -1):
+            t = torch.full((x.shape[0],), float(ts[i]), device=device, dtype=dtype)
+            dt = ts[i + 1] - ts[i]
+            x_next = x
+            for _ in range(iters):
+                velocity = self._pinned_velocity(x, t, geom, cond)
+                x = x_next - dt * velocity
+                if cond:
+                    x[:, :cond] = prefix
         return x

@@ -5,6 +5,7 @@ objects:
   - largetable
   - smallbox
   - largebox
+  - floorlamp
 duration: 1.0
 speed_threshold: 0.2
 sample_hz: null

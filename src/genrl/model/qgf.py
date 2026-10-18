@@ -182,11 +182,11 @@ def qgf_sample(
         x[:, :cond] = prefix
     if geom is not None:
         geom = geom.to(device=device, dtype=dtype)
-    ts = torch.linspace(flow.t_eps, 1.0 - flow.t_eps, steps, device=device, dtype=dtype)
-    dt = ts[1] - ts[0] if steps > 1 else (1.0 - 2.0 * flow.t_eps)
+    ts = flow.time_grid(steps, device, dtype)
     with torch.enable_grad():
-        for t_scalar in ts:
-            t_value = float(t_scalar)
+        for i in range(ts.shape[0] - 1):
+            t_value = float(ts[i])
+            dt = ts[i + 1] - ts[i]
             t = torch.full((shape[0],), t_value, device=device, dtype=dtype)
             with torch.no_grad():
                 velocity = flow.predict(x, t, geom)
