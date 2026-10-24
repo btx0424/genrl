@@ -92,8 +92,14 @@ class GaussianDiffusion(nn.Module):
         steps: int = 80,
         prefix: torch.Tensor | None = None,
         geom: torch.Tensor | None = None,
+        source: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """DDIM sample (eta = 0). ``prefix`` is a clean normalized first-frame block."""
+        """DDIM sample (eta = 0).
+
+        ``prefix`` is a clean normalized first-frame block. ``source`` can set
+        the initial Gaussian state, which is useful for controlled latent-space
+        comparisons; when omitted, sampling uses fresh Gaussian noise.
+        """
         if steps < 2:
             raise ValueError(f"steps must be at least 2, got {steps}.")
         device = self.alphas_cumprod.device
@@ -102,7 +108,12 @@ class GaussianDiffusion(nn.Module):
         keep = torch.ones_like(idx, dtype=torch.bool)
         keep[1:] = idx[1:] != idx[:-1]
         idx = idx[keep]
-        x = torch.randn(shape, device=device, dtype=dtype)
+        if source is None:
+            x = torch.randn(shape, device=device, dtype=dtype)
+        else:
+            if tuple(source.shape) != tuple(shape):
+                raise ValueError(f"source shape {tuple(source.shape)} does not match {shape}.")
+            x = source.to(device=device, dtype=dtype).clone()
         if prefix is not None:
             if prefix.ndim != 3 or prefix.shape[0] != shape[0] or prefix.shape[2] != shape[2]:
                 raise ValueError(
@@ -130,4 +141,128 @@ class GaussianDiffusion(nn.Module):
                 x = torch.sqrt(abar_prev) * x0 + torch.sqrt(1.0 - abar_prev) * pred
             if prefix is not None:
                 x[:, : prefix.shape[1]] = prefix
+        return x
+
+    @torch.no_grad()
+    def invert(
+        self,
+        clip: torch.Tensor,
+        steps: int = 80,
+        prefix: torch.Tensor | None = None,
+        geom: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Deterministic DDIM inversion on the same time grid as ``sample``.
+
+        The result is an approximate initial noise state. Sampling that state
+        with the same prefix, geometry, and number of steps reconstructs the
+        clip up to the usual DDIM inversion error.
+        """
+        if steps < 2:
+            raise ValueError(f"steps must be at least 2, got {steps}.")
+        device = self.alphas_cumprod.device
+        dtype = next(self.parameters()).dtype
+        x = clip.to(device=device, dtype=dtype).clone()
+        cond = 0
+        if prefix is not None:
+            if prefix.ndim != 3 or prefix.shape[0] != x.shape[0] or prefix.shape[2] != x.shape[2]:
+                raise ValueError(
+                    f"prefix shape {tuple(prefix.shape)} does not match clip {tuple(x.shape)}."
+                )
+            if prefix.shape[1] >= x.shape[1]:
+                raise ValueError("prefix must be shorter than the inverted clip.")
+            prefix = prefix.to(device=device, dtype=dtype)
+            cond = int(prefix.shape[1])
+            x[:, :cond] = prefix
+        if geom is not None:
+            geom = geom.to(device=device, dtype=dtype)
+            if geom.shape[0] != x.shape[0]:
+                raise ValueError(f"geom batch {geom.shape[0]} does not match {x.shape[0]}.")
+
+        idx = torch.linspace(self.num_timesteps - 1, 0, steps, device=device).round().long()
+        keep = torch.ones_like(idx, dtype=torch.bool)
+        keep[1:] = idx[1:] != idx[:-1]
+        idx = idx[keep]
+        # Follow the sampling grid from its clean end back to the noisy end.
+        for position in range(len(idx) - 1, 0, -1):
+            current = torch.full(
+                (x.shape[0],), int(idx[position]), device=device, dtype=torch.long
+            )
+            target = torch.full(
+                (x.shape[0],), int(idx[position - 1]), device=device, dtype=torch.long
+            )
+            pred = self.predict(x, current.float() / self.num_timesteps, geom)
+            abar = _extract(self.alphas_cumprod, current, x)
+            x0 = (x - torch.sqrt(1.0 - abar) * pred) / torch.sqrt(abar).clamp_min(1e-8)
+            abar_target = _extract(self.alphas_cumprod, target, x)
+            x = torch.sqrt(abar_target) * x0 + torch.sqrt(1.0 - abar_target) * pred
+            if cond:
+                x[:, :cond] = prefix
+        return x
+
+    @torch.no_grad()
+    def invert(
+        self,
+        clip: torch.Tensor,
+        steps: int = 80,
+        prefix: torch.Tensor | None = None,
+        geom: torch.Tensor | None = None,
+        iters: int = 12,
+    ) -> torch.Tensor:
+        """Recover the initial state of the deterministic DDIM sampler.
+
+        Each reverse DDIM transition is solved by fixed-point iteration because
+        its noise prediction is evaluated at the unknown noisier state.
+        """
+        if steps < 2:
+            raise ValueError(f"steps must be at least 2, got {steps}.")
+        if iters < 1:
+            raise ValueError(f"iters must be positive, got {iters}.")
+        device = self.alphas_cumprod.device
+        dtype = next(self.parameters()).dtype
+        x = clip.to(device=device, dtype=dtype).clone()
+        cond = 0
+        if prefix is not None:
+            if prefix.shape[0] != x.shape[0] or prefix.shape[2] != x.shape[2]:
+                raise ValueError(
+                    f"prefix shape {tuple(prefix.shape)} does not match clip {tuple(x.shape)}."
+                )
+            prefix = prefix.to(device=device, dtype=dtype)
+            cond = int(prefix.shape[1])
+            x[:, :cond] = prefix
+        if geom is not None:
+            geom = geom.to(device=device, dtype=dtype)
+            if geom.shape[0] != x.shape[0]:
+                raise ValueError(f"geom batch {geom.shape[0]} does not match {x.shape[0]}.")
+
+        idx = torch.linspace(self.num_timesteps - 1, 0, steps, device=device).round().long()
+        keep = torch.ones_like(idx, dtype=torch.bool)
+        keep[1:] = idx[1:] != idx[:-1]
+        ascending = idx[keep].flip(0)
+
+        # Invert the sampler's final t=0 prediction, then each DDIM transition.
+        lower = torch.full((x.shape[0],), int(ascending[0]), device=device, dtype=torch.long)
+        abar_lower = _extract(self.alphas_cumprod, lower, x)
+        target = x
+        for _ in range(iters):
+            noise = self.predict(x, lower.float() / self.num_timesteps, geom)
+            x = torch.sqrt(abar_lower) * target + torch.sqrt(1.0 - abar_lower) * noise
+            if cond:
+                x[:, :cond] = prefix
+
+        for upper_value in ascending[1:]:
+            upper = torch.full((x.shape[0],), int(upper_value), device=device, dtype=torch.long)
+            abar_upper = _extract(self.alphas_cumprod, upper, x)
+            target = x
+            estimate = x
+            for _ in range(iters):
+                noise = self.predict(estimate, upper.float() / self.num_timesteps, geom)
+                clean = (target - torch.sqrt(1.0 - abar_lower) * noise) / torch.sqrt(
+                    abar_lower
+                ).clamp_min(1e-8)
+                estimate = torch.sqrt(abar_upper) * clean + torch.sqrt(1.0 - abar_upper) * noise
+                if cond:
+                    estimate[:, :cond] = prefix
+            x = estimate
+            lower = upper
+            abar_lower = abar_upper
         return x

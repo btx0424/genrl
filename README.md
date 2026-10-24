@@ -62,6 +62,8 @@ uv run python -m genrl.data.view --split test --objects smallbox
 | `scripts/train_awd.py` | Advantage-weighted fine-tune of a diffusion checkpoint. |
 | `scripts/train_qgf.py` | QGF critic on a frozen flow-matching checkpoint. Sampling is guided. |
 | `scripts/eval_qgf.py` | Sweep guidance weights for one QGF checkpoint. |
+| `scripts/eval_generator_coverage.py` | Real vs generated windows for every training motion, one clip per checkpoint. |
+| `scripts/eval_generator_generalization.py` | The same windows from novel first frames, scored by distance to the training data. |
 | `src/genrl/data/` | Dataset loader and the fixed-length feature window. |
 | `src/genrl/model/` | 1D U-Net, flow matching, diffusion. |
 | `src/genrl/viz/` | GIF renderer. |
